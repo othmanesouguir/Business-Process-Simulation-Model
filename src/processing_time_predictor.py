@@ -1,18 +1,17 @@
 """
-processing_time_predictor.py
+src/processing_time_predictor.py
 
-Module 1.3 — Processing time predictor (runtime wrapper used by 1.1)
+Module 1.3 — Processing Time Predictor (Runtime Wrapper).
 
-Training happens offline in:
-    processing_times_TRAIN.py
-which produces a cached artifact (pkl). This wrapper only loads it and serves queries.
+This module serves as the inference engine for activity durations. It loads
+pre-trained models (produced by `processing_times_TRAIN.py`) and provides
+time estimates based on activity type, resource, and case context.
 
 Logic:
-  - If activity starts with A_ or O_: return 0.0
-  - Else:
-      * if a BASIC distribution exists -> sample from it
-      * else if an ADVANCED ML model exists -> predict via LightGBM quantile regression
-      * else -> fallback (data-driven median)
+1. System Tasks (A_*, O_*): Return 0.0 (Instantaneous).
+2. Basic Activities: Sample from fitted statistical distributions (LogNorm, Gamma, etc.).
+3. Complex Activities: Predict using LightGBM Quantile Regression.
+4. Fallback: Return global median duration.
 """
 
 from __future__ import annotations
@@ -30,41 +29,53 @@ warnings.filterwarnings("ignore")
 
 
 class ProcessingTimePredictor:
+    """
+    Runtime wrapper for Duration Prediction.
+    Loads a .pkl artifact containing both basic statistical distributions
+    and advanced LightGBM models.
+    """
+
     def __init__(self, model_path: str):
-        # ----------------------------
-        # Resolve model path into /models
-        # ----------------------------
+        """
+        Initialize the predictor by loading the trained model artifact.
+        
+        Args:
+            model_path: Path to the .pkl file (absolute or relative to project root).
+        """
+        # Resolve model path (handle relative paths robustly)
         p = Path(str(model_path))
 
         if not p.exists():
-            # project root = parent of src/
-            project_root = Path(__file__).resolve().parents[1]  # project/
+            # Check relative to project root (parent of src/)
+            project_root = Path(__file__).resolve().parents[1]
             candidate = project_root / "models" / p.name
             if candidate.exists():
                 p = candidate
 
         if not p.exists():
             raise FileNotFoundError(
-                f"ProcessingTimePredictor: cannot find model artifact.\n"
+                f"ProcessingTimePredictor: Cannot find model artifact.\n"
                 f"Given: {model_path}\n"
                 f"Tried: {p}\n"
-                f"Hint: put the .pkl in project/models/"
+                f"Hint: Ensure 'processing_model_advanced.pkl' is in project/models/"
             )
 
         self.model_path = str(p)
         artifact = joblib.load(self.model_path)
 
+        # Unpack components from the artifact
         self.basic_distributions: Dict[str, dict] = artifact.get("basic_distributions", {})
         self.advanced_models: Dict[str, dict] = artifact.get("advanced_models", {})
         self.fallback_sec: float = float(artifact.get("fallback_sec", 600.0))
 
-        # Used by 1.1 advanced/basic interface
+        # Quantiles used by the 1.1 engine (Optimistic, Realistic, Pessimistic)
         self.quantiles = [0.1, 0.5, 0.9]
 
     # ----------------------------
-    # Basic distribution sampling
+    # Basic Distribution Sampling
     # ----------------------------
     def _sample_basic(self, activity: str) -> float:
+        """Samples from a fitted scipy statistical distribution."""
         info = self.basic_distributions.get(activity)
         if not info:
             return float(self.fallback_sec)
@@ -88,13 +99,14 @@ class ProcessingTimePredictor:
         return float(self.fallback_sec)
 
     def _predict_basic(self, activity: str) -> float:
+        """Returns the median value from the basic distribution (no sampling)."""
         info = self.basic_distributions.get(activity)
         if not info:
             return float(self.fallback_sec)
         return float(info.get("median", self.fallback_sec))
 
     # ----------------------------
-    # Advanced ML features
+    # Advanced ML Feature Engineering
     # ----------------------------
     def _build_features(
             self,
@@ -106,21 +118,25 @@ class ProcessingTimePredictor:
             median_fill: dict,
             feature_name_map: dict | None = None,
     ) -> pd.DataFrame:
+        """
+        Constructs a single-row DataFrame compatible with the trained LightGBM model.
+        Applies column mapping and median filling for missing values.
+        """
         row = {}
 
-        # keep only what exists in feature_cols (no extra noise)
+        # Initialize all expected columns
         for c in feature_cols:
             row[c] = None
 
-        # ✅ apply mapping: original_name -> safe_name
+        # Apply mapping: original_name -> safe_name (sanitized for LightGBM)
         feature_name_map = feature_name_map or {}
 
         for k, v in (case_attributes or {}).items():
-            kk = feature_name_map.get(k, k)  # map "case:LoanGoal" -> "case_LoanGoal"
+            kk = feature_name_map.get(k, k)
             if kk in row:
                 row[kk] = v
 
-        # optional resource feature
+        # Add resource features if expected
         if "org_resource" in row:
             row["org_resource"] = resource
         elif "org:resource" in row:
@@ -128,12 +144,12 @@ class ProcessingTimePredictor:
 
         df = pd.DataFrame([row])
 
-        # categorical safety: convert objects to codes if needed
+        # Convert categorical objects to codes (LightGBM requirement)
         for col in df.columns:
             if df[col].dtype == "object":
                 df[col] = df[col].astype("category").cat.codes.replace(-1, np.nan)
 
-        # fill remaining NaNs
+        # Fill missing values with training set medians
         for col, med in (median_fill or {}).items():
             if col in df.columns:
                 df[col] = df[col].fillna(med)
@@ -142,7 +158,7 @@ class ProcessingTimePredictor:
         return df
 
     # ----------------------------
-    # Public API used by 1.1
+    # Public API (Used by Simulation Engine)
     # ----------------------------
     def sample_duration(
         self,
@@ -154,16 +170,28 @@ class ProcessingTimePredictor:
         quantile: float = 0.5,
         return_all_quantiles: bool = False,
     ):
+        """
+        Main entry point to predict duration for an activity instance.
+        
+        Args:
+            activity: The name of the task.
+            case_attributes: Dictionary of case data (LoanAmount, etc.).
+            resource: The resource assigned to the task.
+            current_time: The simulation timestamp.
+            method: 'median' (deterministic) or 'sample' (stochastic).
+            quantile: The specific quantile to predict (if using ML).
+            return_all_quantiles: If True, returns dict {0.1: val, 0.5: val, 0.9: val}.
+        """
         if current_time is None:
             current_time = datetime.utcnow()
 
-        # A_ and O_ are treated as instant
+        # 1. System Tasks are instantaneous
         if activity.startswith("A_") or activity.startswith("O_"):
             if return_all_quantiles:
                 return {q: 0.0 for q in self.quantiles}
             return 0.0
 
-        # If we have a basic distribution -> use it
+        # 2. Basic Distribution Strategy
         if activity in self.basic_distributions:
             if method == "sample":
                 v = float(self._sample_basic(activity))
@@ -175,9 +203,10 @@ class ProcessingTimePredictor:
                 return {q: v for q in self.quantiles}
             return v
 
-        # Advanced ML path if available
+        # 3. Advanced ML Strategy
         adv = self.advanced_models.get(activity)
         if not adv:
+            # No model found -> Fallback
             if return_all_quantiles:
                 return {q: float(self.fallback_sec) for q in self.quantiles}
             return float(self.fallback_sec)
@@ -213,7 +242,7 @@ class ProcessingTimePredictor:
                     out[q] = float(model.predict(X)[0])
             return out
 
-        # single quantile
+        # Single quantile prediction
         if quantile not in models:
             quantile = 0.5
 
