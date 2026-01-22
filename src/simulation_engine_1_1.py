@@ -3,9 +3,12 @@ simulation_engine_1_1.py
 
 Module 1.1 — Discrete Event Simulation Engine (your exact design)
 
-✅ FIXES:
+✅ FIXES / IMPROVEMENTS:
 - Still simulates arrivals, but DOES NOT log "case_arrival"
 - DOES NOT log "case_end"
+- ✅ Schedule semantics fixed:
+    -> log "schedule" ONLY if the activity actually waited (could not start immediately at same timestamp)
+- ✅ Adds ALL case attributes into every event row (LoanGoal, ApplicationType, RequestedAmount, etc.)
 - Can export BOTH CSV and XES into outputs/
 
 Uses:
@@ -67,10 +70,12 @@ class Event:
 
 @dataclass
 class Task:
+    uid: str
     case_id: str
     activity: str
     ready_ts: pd.Timestamp
     remaining_s: Optional[float] = None  # only for suspended tasks
+    pending_schedule: bool = False       # ✅ schedule is logged only if it actually waits
 
 
 @dataclass
@@ -91,13 +96,9 @@ class CaseAttributeSampler:
     """
     Samples realistic case attributes from historical BPIC CSV.
 
-    - LoanGoal sampled by its real frequency
-    - ApplicationType sampled by its real frequency
-    - RequestedAmount sampled logically:
-        prefer conditional by (LoanGoal, ApplicationType),
-        then by LoanGoal,
-        else global.
-      + bounded by per-goal q05..q95 range
+    IMPORTANT:
+    ✅ LoanGoal + ApplicationType are sampled ONLY from values that exist in the historical CSV.
+    ✅ If those columns are missing/empty, we raise an ERROR to avoid fake values.
     """
 
     def __init__(self, csv_path: str, seed: int = 42):
@@ -121,6 +122,18 @@ class CaseAttributeSampler:
         self.bounds_by_goal_app: Dict[Tuple[str, str], Tuple[float, float]] = {}
 
         self._load()
+
+        # ✅ hard safety: do NOT generate "Unknown" goals/types
+        if len(self.loan_goals) == 0:
+            raise ValueError(
+                "CaseAttributeSampler: No LoanGoal values loaded from the CSV.\n"
+                "Check that column 'case:LoanGoal' exists and is not empty."
+            )
+        if len(self.app_types) == 0:
+            raise ValueError(
+                "CaseAttributeSampler: No ApplicationType values loaded from the CSV.\n"
+                "Check that column 'case:ApplicationType' exists and is not empty."
+            )
 
     def _safe_probs(self, counts: pd.Series) -> np.ndarray:
         p = counts.to_numpy(dtype=float)
@@ -234,16 +247,8 @@ class CaseAttributeSampler:
         return self._round_amount(x)
 
     def sample(self) -> Dict[str, Any]:
-        if self.loan_goals:
-            loan_goal = str(self.rng.choice(self.loan_goals, p=self.loan_goal_p))
-        else:
-            loan_goal = "Unknown"
-
-        if self.app_types:
-            app_type = str(self.rng.choice(self.app_types, p=self.app_type_p))
-        else:
-            app_type = "Unknown"
-
+        loan_goal = str(self.rng.choice(self.loan_goals, p=self.loan_goal_p))
+        app_type = str(self.rng.choice(self.app_types, p=self.app_type_p))
         requested_amount = self._sample_amount_logical(loan_goal, app_type)
 
         out: Dict[str, Any] = {
@@ -297,7 +302,7 @@ class SimulationEngine:
         self.start_time = pd.Timestamp(start_time).tz_convert("UTC")
         self.end_time = pd.Timestamp(end_time).tz_convert("UTC")
 
-        # ✅ Force output into outputs/ folder
+        # ✅ Force outputs into outputs/
         project_root = Path(__file__).resolve().parents[1]
         outputs_dir = project_root / "outputs"
         outputs_dir.mkdir(parents=True, exist_ok=True)
@@ -329,7 +334,8 @@ class SimulationEngine:
         self.waiting: Deque[Task] = deque()
 
         self.case_counter = 0
-        self.task_counter = 0
+        self.exec_counter = 0
+        self.wait_uid_counter = 0
 
         self.case_attrs: Dict[str, Dict[str, Any]] = {}
         self.case_last2: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
@@ -353,23 +359,37 @@ class SimulationEngine:
             return None
         return heapq.heappop(self.eventq)[-1]
 
+    # ---------- IDs ----------
+    def _new_case_id(self) -> str:
+        self.case_counter += 1
+        return f"Case_{self.case_counter}"
+
+    def _new_exec_id(self) -> str:
+        self.exec_counter += 1
+        return f"T{self.exec_counter}"
+
+    def _new_wait_uid(self) -> str:
+        self.wait_uid_counter += 1
+        return f"W{self.wait_uid_counter}"
+
     # ---------- Logging ----------
     def _log(self, ts: pd.Timestamp, case_id: str, activity: str, transition: str, resource: Optional[str]):
-        self.log_rows.append(
-            {
-                "time:timestamp": pd.Timestamp(ts).tz_convert("UTC").isoformat(),
-                "case:concept:name": case_id,
-                "concept:name": activity,
-                "lifecycle:transition": transition,
-                "org:resource": resource if resource else "",
-            }
-        )
+        row = {
+            "time:timestamp": pd.Timestamp(ts).tz_convert("UTC").isoformat(),
+            "case:concept:name": case_id,
+            "concept:name": activity,
+            "lifecycle:transition": transition,
+            "org:resource": resource if resource else "",
+        }
 
-    def _enqueue_waiting(self, t: pd.Timestamp, task: Task):
-        t = pd.Timestamp(t).tz_convert("UTC")
-        self.waiting.append(task)
-        # BPIC-style schedule log
-        self._log(t, task.case_id, task.activity, "schedule", "")
+        # ✅ add ALL case attributes into every log row
+        attrs = self.case_attrs.get(case_id, {})
+        for k, v in (attrs or {}).items():
+            # keep safe if duplicate keys appear
+            if k not in row:
+                row[k] = v
+
+        self.log_rows.append(row)
 
     # ---------- Buckets ----------
     def _next_bucket_boundary(self, t: pd.Timestamp) -> pd.Timestamp:
@@ -390,14 +410,35 @@ class SimulationEngine:
     def _bucket_end(self, t: pd.Timestamp) -> pd.Timestamp:
         return self._next_bucket_boundary(t)
 
-    # ---------- IDs ----------
-    def _new_case_id(self) -> str:
-        self.case_counter += 1
-        return f"Case_{self.case_counter}"
+    # ---------- Waiting enqueue (NO schedule log here) ----------
+    def _enqueue_waiting_no_log(self, t: pd.Timestamp, case_id: str, activity: str) -> Task:
+        """
+        ✅ New semantic:
+        We add to WA, but we DO NOT log schedule here.
+        Schedule will be logged ONLY after dispatch attempt if the task is still waiting.
+        """
+        t = pd.Timestamp(t).tz_convert("UTC")
+        task = Task(
+            uid=self._new_wait_uid(),
+            case_id=case_id,
+            activity=activity,
+            ready_ts=t,
+            remaining_s=None,
+            pending_schedule=True,
+        )
+        self.waiting.append(task)
+        return task
 
-    def _new_task_id(self) -> str:
-        self.task_counter += 1
-        return f"T{self.task_counter}"
+    def _flush_schedules(self, t: pd.Timestamp):
+        """
+        ✅ After RECHECK allocation at time t:
+        log schedule for tasks that are STILL waiting and became ready at time t.
+        """
+        t = pd.Timestamp(t).tz_convert("UTC")
+        for task in self.waiting:
+            if task.pending_schedule and task.ready_ts == t:
+                self._log(t, task.case_id, task.activity, "schedule", "")
+                task.pending_schedule = False
 
     # ---------- Start/Resume ----------
     def _start_or_resume_task(self, t: pd.Timestamp, task: Task, resource: str, *, resumed: bool):
@@ -434,9 +475,9 @@ class SimulationEngine:
 
         dur_s = max(1.0, float(dur_s))
 
-        task_id = self._new_task_id()
+        exec_id = self._new_exec_id()
         ex = Execution(
-            task_id=task_id,
+            task_id=exec_id,
             case_id=task.case_id,
             activity=task.activity,
             resource=resource,
@@ -445,7 +486,7 @@ class SimulationEngine:
             complete_ts=None,
         )
 
-        self.executing[task_id] = ex
+        self.executing[exec_id] = ex
         self.busy_resources.add(resource)
 
         self._log(t, task.case_id, task.activity, "resume" if resumed else "start", resource)
@@ -454,7 +495,7 @@ class SimulationEngine:
         if dur_s <= bucket_remaining_s + 1e-9:
             complete_ts = t + pd.to_timedelta(dur_s, unit="s")
             ex.complete_ts = complete_ts
-            self._push_event(complete_ts, EventType.ACTIVITY_COMPLETE, {"task_id": task_id})
+            self._push_event(complete_ts, EventType.ACTIVITY_COMPLETE, {"task_id": exec_id})
 
     # ---------- Complete ----------
     def _complete_task(self, t: pd.Timestamp, task_id: str):
@@ -476,7 +517,7 @@ class SimulationEngine:
         prev2, prev1 = self.case_last2.get(ex.case_id, (None, None))
         self.case_last2[ex.case_id] = (prev1, ex.activity)
 
-        # ✅ FIX: do NOT log case_end
+        # ✅ do NOT log "case_end"
         if hasattr(self.bpmn, "is_final") and self.bpmn.is_final(ex.activity):
             return
 
@@ -484,7 +525,7 @@ class SimulationEngine:
         if hasattr(self.bpmn, "allowed_next"):
             allowed_next = list(self.bpmn.allowed_next(ex.activity, self.case_attrs[ex.case_id]) or [])
 
-        # ✅ FIX: do NOT log case_end
+        # ✅ do NOT log "case_end"
         if not allowed_next:
             return
 
@@ -497,7 +538,10 @@ class SimulationEngine:
             else:
                 nxt = str(self.rng.choice(allowed_next))
 
-        self._enqueue_waiting(t, Task(case_id=ex.case_id, activity=nxt, ready_ts=t))
+        # enqueue without logging schedule yet
+        self._enqueue_waiting_no_log(t, ex.case_id, nxt)
+
+        # dispatch at same timestamp
         self._push_event(t, EventType.RECHECK, {})
 
     # ---------- RESOURCE_CHECK ----------
@@ -536,10 +580,12 @@ class SimulationEngine:
 
             self.suspended.append(
                 Task(
+                    uid=self._new_wait_uid(),
                     case_id=ex.case_id,
                     activity=ex.activity,
                     ready_ts=t,
                     remaining_s=float(ex.remaining_s),
+                    pending_schedule=False,  # suspended is not "schedule"
                 )
             )
 
@@ -660,9 +706,9 @@ class SimulationEngine:
                 else:
                     first_act = "A_Create Application"
 
-                # ✅ FIX: DO NOT log "case_arrival"
-                # Only enqueue -> which logs "schedule"
-                self._enqueue_waiting(t, Task(case_id=case_id, activity=first_act, ready_ts=t))
+                # ✅ do NOT log case_arrival
+                # enqueue without schedule log yet
+                self._enqueue_waiting_no_log(t, case_id, first_act)
 
                 # schedule next case arrival
                 t_next = self.arrivals.next_arrival_time(t)
@@ -679,7 +725,10 @@ class SimulationEngine:
                 self._resource_check(t)
 
             elif ev.type == EventType.RECHECK:
+                # dispatch tasks
                 self._allocate(t)
+                # ✅ NOW log schedule only for tasks that truly waited
+                self._flush_schedules(t)
 
         # Write CSV
         out_csv = Path(self.out_csv_path)
